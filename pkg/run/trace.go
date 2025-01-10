@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/google/uuid"
 	"github.com/inngest/inngest/pkg/consts"
 	"github.com/inngest/inngest/pkg/cqrs"
@@ -72,10 +73,13 @@ func NewRunTree(opts RunTreeOpts) (*runTree, error) {
 		processed: map[string]bool{},
 	}
 
+	spew.Dump(opts.Spans)
+
 	for _, s := range opts.Spans {
 		// ignore parallelism planning spans
 		if s.StepOpCode() == enums.OpcodeStepPlanned {
 			if _, ok := s.SpanAttributes[consts.OtelSysStepPlan]; ok {
+				spew.Dump("SKIPPING SPAN", s, "\n\n\n\n\n")
 				continue
 			}
 		}
@@ -133,6 +137,8 @@ func NewRunTree(opts RunTreeOpts) (*runTree, error) {
 	if b.trigger == nil {
 		return nil, fmt.Errorf("no trigger span found")
 	}
+
+	spew.Dump(b.groups)
 
 	return b, nil
 }
@@ -1267,6 +1273,8 @@ func (tb *runTree) processAIGatewayGroup(ctx context.Context, span *cqrs.Span, m
 	if err != nil {
 		return err
 	}
+
+	spew.Dump("PROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUPPROCESSING AI GATEWAY GROUP", group)
 
 	if len(group) == 1 {
 		return tb.processAIGateway(ctx, span, mod)
