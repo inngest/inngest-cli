@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/inngest/inngest/pkg/telemetry/metrics"
 	"io"
 	"log/slog"
 	"net"
@@ -23,7 +22,9 @@ import (
 	"github.com/inngest/inngest/pkg/connect/types"
 	"github.com/inngest/inngest/pkg/connect/wsproto"
 	"github.com/inngest/inngest/pkg/syscode"
+	"github.com/inngest/inngest/pkg/telemetry/metrics"
 	"github.com/inngest/inngest/proto/gen/connect/v1"
+	"github.com/oklog/ulid/v2"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 )
@@ -179,6 +180,10 @@ func (c *connectGatewaySvc) Handler() http.Handler {
 				ch.log.Error("could not update connection status after context done", "err", err)
 			}
 
+			for _, l := range c.lifecycles {
+				go l.OnStartDraining(context.Background(), conn)
+			}
+
 			closeReason = "gateway-draining"
 
 			// Close WS connection once worker established another connection
@@ -211,7 +216,7 @@ func (c *connectGatewaySvc) Handler() http.Handler {
 			// This is a transactional operation, it should always complete regardless of context cancellation
 
 			// TODO Persist disconnected status in history for UI (show disconnected connections with reason)
-			err := c.stateManager.DeleteConnection(context.Background(), conn.Group.EnvID, conn.Group.AppID, conn.Group.Hash, conn.Session.SessionId.ConnectionId)
+			err := c.stateManager.DeleteConnection(context.Background(), conn.Group.EnvID, conn.Group.AppID, conn.Group.Hash, conn.ConnectionId)
 			switch err {
 			case nil, state.ConnDeletedWithGroupErr:
 				// no-op
@@ -220,7 +225,7 @@ func (c *connectGatewaySvc) Handler() http.Handler {
 			}
 
 			for _, lifecycle := range c.lifecycles {
-				lifecycle.OnDisconnected(context.Background(), closeReason)
+				lifecycle.OnDisconnected(context.Background(), conn, closeReason)
 			}
 		}()
 
@@ -296,6 +301,10 @@ func (c *connectGatewaySvc) Handler() http.Handler {
 					// immediately stop routing messages to this connection
 					if err := ch.updateConnStatus(connect.ConnectionStatus_DISCONNECTING); err != nil {
 						ch.log.Error("could not update connection status after read error", "err", err)
+					}
+
+					for _, l := range c.lifecycles {
+						go l.OnStartDraining(context.Background(), conn)
 					}
 
 					closeErr := websocket.CloseError{}
@@ -380,8 +389,7 @@ func (c *connectGatewaySvc) Handler() http.Handler {
 			}
 
 			// Mark connection as ready to receive traffic unless we require manual client ready signal (optional)
-			conn.Status = connect.ConnectionStatus_READY
-			err = c.stateManager.UpsertConnection(ctx, conn)
+			err = c.stateManager.UpsertConnection(ctx, conn, connect.ConnectionStatus_READY, time.Now())
 			if err != nil {
 				if ctx.Err() != nil {
 					c.closeDraining(ws)
@@ -396,6 +404,10 @@ func (c *connectGatewaySvc) Handler() http.Handler {
 				})
 
 				return
+			}
+
+			for _, l := range c.lifecycles {
+				go l.OnReady(context.Background(), conn)
 			}
 		}
 
@@ -446,6 +458,10 @@ func (c *connectionHandler) handleIncomingWebSocketMessage(appId uuid.UUID, msg 
 			}
 		}
 
+		for _, l := range c.svc.lifecycles {
+			go l.OnReady(context.Background(), c.conn)
+		}
+
 		return nil
 	case connect.GatewayMessageType_WORKER_HEARTBEAT:
 		if c.svc.isDraining {
@@ -462,6 +478,10 @@ func (c *connectionHandler) handleIncomingWebSocketMessage(appId uuid.UUID, msg 
 			}
 		}
 
+		for _, l := range c.svc.lifecycles {
+			go l.OnHeartbeat(context.Background(), c.conn)
+		}
+
 		return nil
 	case connect.GatewayMessageType_WORKER_PAUSE:
 		if c.svc.isDraining {
@@ -476,6 +496,10 @@ func (c *connectionHandler) handleIncomingWebSocketMessage(appId uuid.UUID, msg 
 				StatusCode: websocket.StatusInternalError,
 				Msg:        "could not update connection status",
 			}
+		}
+
+		for _, l := range c.svc.lifecycles {
+			go l.OnStartDraining(context.Background(), c.conn)
 		}
 
 		return nil
@@ -539,7 +563,7 @@ func (c *connectionHandler) receiveRouterMessages(ctx context.Context, appId uui
 	// Receive execution-related messages for the app, forwarded by the router.
 	// The router selects only one gateway to handle a request from a pool of one or more workers (and thus WebSockets)
 	// running for each app.
-	err := c.svc.receiver.ReceiveRoutedRequest(ctx, c.svc.gatewayId, appId, c.conn.Session.SessionId.ConnectionId, func(rawBytes []byte, data *connect.GatewayExecutorRequestData) {
+	err := c.svc.receiver.ReceiveRoutedRequest(ctx, c.svc.gatewayId, appId, c.conn.ConnectionId, func(rawBytes []byte, data *connect.GatewayExecutorRequestData) {
 		log := c.log.With(
 			"req_id", data.RequestId,
 			"fn_slug", data.FunctionSlug,
@@ -653,6 +677,30 @@ func (c *connectionHandler) establishConnection(ctx context.Context) (*state.Con
 		}
 	}
 
+	// Ensure connection ID is valid ULID
+	var connectionId ulid.ULID
+	{
+		if initialMessageData.SessionId == nil || initialMessageData.SessionId.ConnectionId == "" {
+			c.log.Debug("initial SDK message contained invalid connection ID")
+
+			return nil, &SocketError{
+				SysCode:    syscode.CodeConnectWorkerHelloInvalidPayload,
+				StatusCode: websocket.StatusPolicyViolation,
+				Msg:        "Invalid connection ID in SDK connect message",
+			}
+		}
+
+		if connectionId, err = ulid.Parse(initialMessageData.SessionId.ConnectionId); err != nil {
+			c.log.Debug("initial SDK message contained invalid connection ID")
+
+			return nil, &SocketError{
+				SysCode:    syscode.CodeConnectWorkerHelloInvalidPayload,
+				StatusCode: websocket.StatusPolicyViolation,
+				Msg:        "Invalid connection ID in SDK connect message",
+			}
+		}
+	}
+
 	var authResp *auth.Response
 	{
 		// Run auth, add to distributed state
@@ -720,11 +768,9 @@ func (c *connectionHandler) establishConnection(ctx context.Context) (*state.Con
 	}
 
 	conn := state.Connection{
-		AccountID: authResp.AccountID,
-		EnvID:     authResp.EnvID,
-
-		// Mark initial status, not ready to receive messages yet
-		Status: connect.ConnectionStatus_CONNECTED,
+		AccountID:    authResp.AccountID,
+		EnvID:        authResp.EnvID,
+		ConnectionId: connectionId,
 
 		Data:    &initialMessageData,
 		Session: sessionDetails,
@@ -738,7 +784,7 @@ func (c *connectionHandler) establishConnection(ctx context.Context) (*state.Con
 		// This is a transactional operation, it should always complete regardless of context cancellation
 
 		// Connection should always be upserted, we don't want inconsistent state
-		if err := c.svc.stateManager.UpsertConnection(context.Background(), &conn); err != nil {
+		if err := c.svc.stateManager.UpsertConnection(context.Background(), &conn, connect.ConnectionStatus_CONNECTED, time.Now()); err != nil {
 			log.Error("adding connection state failed", "err", err)
 			return nil, &SocketError{
 				SysCode:    syscode.CodeConnectInternal,
@@ -778,8 +824,6 @@ func (c *connectionHandler) updateConnStatus(status connect.ConnectionStatus) er
 	c.updateLock.Lock()
 	defer c.updateLock.Unlock()
 
-	c.conn.Status = status
-
 	// Always update the connection status, do not use context cancellation
-	return c.svc.stateManager.UpsertConnection(context.Background(), c.conn)
+	return c.svc.stateManager.UpsertConnection(context.Background(), c.conn, status, time.Now())
 }

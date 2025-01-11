@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/inngest/inngest/pkg/connect/auth"
+	"github.com/inngest/inngest/pkg/connect/lifecycles"
 	"github.com/inngest/inngest/pkg/testapi"
 
 	"github.com/alicebob/miniredis/v2"
@@ -440,6 +441,10 @@ func start(ctx context.Context, opts StartOpts) error {
 		connect.WithDev(),
 		connect.WithGatewayPublicPort(8289),
 		connect.WithApiBaseUrl(fmt.Sprintf("http://127.0.0.1:%d", opts.Config.EventAPI.Port)),
+		connect.WithLifeCycles(
+			[]connect.ConnectGatewayLifecycleListener{
+				lifecycles.NewHistoryLifecycle(dbcqrs),
+			}),
 	)
 	connRouter := connect.NewConnectMessageRouterService(connectionManager, gatewayProxy)
 
