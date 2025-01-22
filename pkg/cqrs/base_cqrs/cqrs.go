@@ -7,11 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/aws/smithy-go/ptr"
-	connpb "github.com/inngest/inngest/proto/gen/connect/v1"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aws/smithy-go/ptr"
+	connpb "github.com/inngest/inngest/proto/gen/connect/v1"
 
 	sq "github.com/doug-martin/goqu/v9"
 	_ "github.com/doug-martin/goqu/v9/dialect/postgres"
@@ -97,6 +98,8 @@ func (w wrapper) LoadFunction(ctx context.Context, envID, fnID uuid.UUID) (*stat
 	if err != nil {
 		return nil, err
 	}
+	// Append the app name as the user facing "app id"
+	def.AppID = app.Name
 
 	return &state.ExecutorFunction{
 		Function:     def,
@@ -1560,7 +1563,7 @@ func (w wrapper) InsertWorkerConnection(ctx context.Context, conn *cqrs.WorkerCo
 		DisconnectedAt:  disconnectedAt,
 		RecordedAt:      conn.RecordedAt.UnixMilli(),
 		InsertedAt:      time.Now().UnixMilli(),
-		
+
 		DisconnectReason: disconnectReason,
 
 		GroupHash:     []byte(conn.GroupHash),
@@ -1974,10 +1977,10 @@ func (w wrapper) GetWorkerConnections(ctx context.Context, opt cqrs.GetWorkerCon
 // copyWriter allows running duck-db specific functions as CQRS functions, copying CQRS types to DDB types
 // automatically.
 func copyWriter[
-PARAMS_IN any,
-INTERNAL_PARAMS any,
-IN any,
-OUT any,
+	PARAMS_IN any,
+	INTERNAL_PARAMS any,
+	IN any,
+	OUT any,
 ](
 	ctx context.Context,
 	f func(context.Context, INTERNAL_PARAMS) (IN, error),
@@ -2000,8 +2003,8 @@ OUT any,
 }
 
 func copyInto[
-IN any,
-OUT any,
+	IN any,
+	OUT any,
 ](
 	ctx context.Context,
 	f func(context.Context) (IN, error),
